@@ -10,8 +10,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# We removed the RUN warm-up lines to prevent the GPU initialization crash
-
 COPY handler.py .
 
 CMD ["python3", "handler.py"]

@@ -1,32 +1,26 @@
 import runpod, os, uuid, shutil, subprocess, requests, time, traceback
 import cv2, numpy as np
-import torch
 
-print(f"GPU available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU device: {torch.cuda.get_device_name(0)}")
-
-# Lazy init — models load on first job, not on worker startup
-_lama = None
-_ocr = None
+# Lightweight imports only ^^
+# Heavy models loaded INSIDE handler on first job
 
 def get_lama():
-    global _lama
-    if _lama is None:
+    """Lazy load LaMa (GPU accelerated)"""
+    if not hasattr(get_lama, '_instance'):
         print("Loading LaMa model...")
         from simple_lama_inpainting import SimpleLama
-        _lama = SimpleLama()
+        get_lama._instance = SimpleLama()
         print("LaMa loaded")
-    return _lama
+    return get_lama._instance
 
 def get_ocr():
-    global _ocr
-    if _ocr is None:
+    """Lazy load PaddleOCR (CPU is fine for text detection)"""
+    if not hasattr(get_ocr, '_instance'):
         print("Loading PaddleOCR model...")
         from paddleocr import PaddleOCR
-        _ocr = PaddleOCR(lang='en', use_gpu=False)
+        get_ocr._instance = PaddleOCR(lang='en', use_gpu=False)
         print("PaddleOCR loaded")
-    return _ocr
+    return get_ocr._instance
 
 def detect_text_mask(img_bgr):
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)

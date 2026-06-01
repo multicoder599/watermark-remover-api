@@ -4,7 +4,7 @@ torchvision
 opencv-python-headless
 simple-lama-inpainting
 paddleocr
-paddlepaddle-gpu==2.5.2
+paddlepaddle
 numpy
 requests
 Pillow

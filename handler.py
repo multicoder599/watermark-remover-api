@@ -1,23 +1,31 @@
-import runpod, os, uuid, shutil, subprocess, requests, time
+import runpod, os, uuid, shutil, subprocess, requests, time, traceback
 import cv2, numpy as np
 from simple_lama_inpainting import SimpleLama
 from paddleocr import PaddleOCR
 import torch
 
+print(f"GPU available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU device: {torch.cuda.get_device_name(0)}")
+
 lama = SimpleLama()
 ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=torch.cuda.is_available())
+print("Models loaded successfully")
 
 def detect_text_mask(img_bgr):
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
-    res = ocr.ocr(rgb, cls=True)
-    if res and res[0]:
-        for line in res[0]:
-            pts = np.array(line[0], dtype=np.int32)
-            cv2.fillPoly(mask, [pts], 255)
-        kernel = np.ones((9, 9), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=2)
+    try:
+        res = ocr.ocr(rgb, cls=True)
+        if res and res[0]:
+            for line in res[0]:
+                pts = np.array(line[0], dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
+            kernel = np.ones((9, 9), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=2)
+    except Exception as e:
+        print(f"OCR error: {e}")
     return mask
 
 def process_image(input_path, output_path):
@@ -54,6 +62,7 @@ def process_video(input_path, output_path):
     if idx == 0:
         return {"error": "Empty video"}
     
+    print(f"Processing {idx} frames...")
     first = cv2.imread(f"{tmp}/frames/000000.jpg")
     mask = detect_text_mask(first)
     
@@ -64,8 +73,10 @@ def process_video(input_path, output_path):
             cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         else:
             cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if i % 30 == 0:
+            print(f"Frame {i}/{idx}")
     
-    # Check if original has audio
+    # Check audio
     has_audio = False
     try:
         probe = subprocess.run(
@@ -74,7 +85,7 @@ def process_video(input_path, output_path):
         )
         has_audio = 'audio' in probe.stdout
     except Exception:
-        has_audio = False
+        pass
     
     if has_audio:
         audio_path = os.path.join(tmp, "audio.aac")
@@ -101,11 +112,13 @@ def send_webhook(webhook_url, payload, files=None, max_retries=3):
     for attempt in range(max_retries):
         try:
             if files:
-                requests.post(webhook_url, files=files, data=payload, timeout=120)
+                r = requests.post(webhook_url, files=files, data=payload, timeout=120)
             else:
-                requests.post(webhook_url, json=payload, timeout=30)
+                r = requests.post(webhook_url, json=payload, timeout=30)
+            print(f"Webhook attempt {attempt+1}: {r.status_code}")
             return True
         except Exception as e:
+            print(f"Webhook attempt {attempt+1} failed: {e}")
             if attempt == max_retries - 1:
                 raise e
             time.sleep(2 ** attempt)
@@ -118,6 +131,8 @@ def handler(job):
     webhook_url = input_data.get("webhook_url")
     job_id = input_data.get("job_id")
 
+    print(f"Job {job_id} started. Type: {file_type}")
+
     if not file_url or not webhook_url:
         return {"error": "Missing file_url or webhook_url"}
 
@@ -128,40 +143,53 @@ def handler(job):
     output_path = os.path.join(tmp, f"result{ext}")
 
     try:
-        # Download with retry
+        # Download
+        print(f"Downloading from {file_url}")
         for attempt in range(3):
             try:
                 r = requests.get(file_url, timeout=120)
                 r.raise_for_status()
                 break
-            except Exception:
+            except Exception as e:
+                print(f"Download attempt {attempt+1} failed: {e}")
                 if attempt == 2:
                     raise
                 time.sleep(2)
         
         with open(input_path, "wb") as f:
             f.write(r.content)
+        print(f"Downloaded {os.path.getsize(input_path)} bytes")
 
+        # Process
         if file_type == "image":
             res = process_image(input_path, output_path)
         else:
             res = process_video(input_path, output_path)
 
         if res.get("error"):
+            print(f"Processing error: {res['error']}")
             send_webhook(webhook_url, {"job_id": job_id, "error": res["error"]})
             return res
 
+        print(f"Uploading result to webhook")
         with open(output_path, "rb") as f:
             send_webhook(
                 webhook_url,
                 {"job_id": job_id, "file_type": file_type},
                 files={"file": (f"result{ext}", f)}
             )
+        print(f"Job {job_id} completed")
         return {"success": True}
 
     except Exception as e:
-        send_webhook(webhook_url, {"job_id": job_id, "error": str(e)})
-        return {"error": str(e)}
+        err_msg = str(e)
+        print(f"Job {job_id} crashed: {err_msg}")
+        print(traceback.format_exc())
+        try:
+            send_webhook(webhook_url, {"job_id": job_id, "error": err_msg})
+        except Exception:
+            pass
+        return {"error": err_msg}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

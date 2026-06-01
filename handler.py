@@ -1,24 +1,39 @@
 import runpod, os, uuid, shutil, subprocess, requests, time, traceback
 import cv2, numpy as np
-from simple_lama_inpainting import SimpleLama
-from paddleocr import PaddleOCR
 import torch
 
 print(f"GPU available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU device: {torch.cuda.get_device_name(0)}")
 
-lama = SimpleLama()
+# Lazy init — models load on first job, not on worker startup
+_lama = None
+_ocr = None
 
-# CPU paddle is much lighter and builds faster. OCR on CPU is fine.
-ocr = PaddleOCR(lang='en', use_gpu=False)
-print("Models loaded successfully")
+def get_lama():
+    global _lama
+    if _lama is None:
+        print("Loading LaMa model...")
+        from simple_lama_inpainting import SimpleLama
+        _lama = SimpleLama()
+        print("LaMa loaded")
+    return _lama
+
+def get_ocr():
+    global _ocr
+    if _ocr is None:
+        print("Loading PaddleOCR model...")
+        from paddleocr import PaddleOCR
+        _ocr = PaddleOCR(lang='en', use_gpu=False)
+        print("PaddleOCR loaded")
+    return _ocr
 
 def detect_text_mask(img_bgr):
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     try:
+        ocr = get_ocr()
         res = ocr.ocr(rgb)
         if res and res[0]:
             for line in res[0]:
@@ -37,6 +52,7 @@ def process_image(input_path, output_path):
     mask = detect_text_mask(img)
     if np.max(mask) == 0:
         return {"error": "No watermark detected"}
+    lama = get_lama()
     result = lama(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask)
     cv2.imwrite(output_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
     return {"success": True}
@@ -67,6 +83,7 @@ def process_video(input_path, output_path):
     print(f"Processing {idx} frames...")
     first = cv2.imread(f"{tmp}/frames/000000.jpg")
     mask = detect_text_mask(first)
+    lama = get_lama()
     
     for i in range(idx):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")

@@ -10,13 +10,8 @@ if torch.cuda.is_available():
 
 lama = SimpleLama()
 
-# FIXED: Removed show_log and use_angle_cls (deprecated/unknown in newer PaddleOCR)
-try:
-    ocr = PaddleOCR(lang='en', use_gpu=torch.cuda.is_available())
-except Exception as e:
-    print(f"PaddleOCR GPU init failed: {e}, falling back to CPU")
-    ocr = PaddleOCR(lang='en', use_gpu=False)
-
+# CPU paddle is much lighter and builds faster. OCR on CPU is fine.
+ocr = PaddleOCR(lang='en', use_gpu=False)
 print("Models loaded successfully")
 
 def detect_text_mask(img_bgr):

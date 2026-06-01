@@ -9,7 +9,14 @@ if torch.cuda.is_available():
     print(f"GPU device: {torch.cuda.get_device_name(0)}")
 
 lama = SimpleLama()
-ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=torch.cuda.is_available())
+
+# FIXED: Removed show_log and use_angle_cls (deprecated/unknown in newer PaddleOCR)
+try:
+    ocr = PaddleOCR(lang='en', use_gpu=torch.cuda.is_available())
+except Exception as e:
+    print(f"PaddleOCR GPU init failed: {e}, falling back to CPU")
+    ocr = PaddleOCR(lang='en', use_gpu=False)
+
 print("Models loaded successfully")
 
 def detect_text_mask(img_bgr):
@@ -17,7 +24,7 @@ def detect_text_mask(img_bgr):
     h, w = rgb.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     try:
-        res = ocr.ocr(rgb, cls=True)
+        res = ocr.ocr(rgb)
         if res and res[0]:
             for line in res[0]:
                 pts = np.array(line[0], dtype=np.int32)
@@ -143,7 +150,6 @@ def handler(job):
     output_path = os.path.join(tmp, f"result{ext}")
 
     try:
-        # Download
         print(f"Downloading from {file_url}")
         for attempt in range(3):
             try:
@@ -160,7 +166,6 @@ def handler(job):
             f.write(r.content)
         print(f"Downloaded {os.path.getsize(input_path)} bytes")
 
-        # Process
         if file_type == "image":
             res = process_image(input_path, output_path)
         else:

@@ -1,34 +1,30 @@
 import runpod, os, uuid, shutil, subprocess, requests, time, traceback
 import cv2, numpy as np
-import torch
-from PIL import Image
-from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+
+# Lazy init — models load on first job
+_lama = None
+_ocr = None
 
 def get_lama():
-    if not hasattr(get_lama, '_instance'):
+    global _lama
+    if _lama is None:
         print("Loading LaMa model...")
         from simple_lama_inpainting import SimpleLama
-        get_lama._instance = SimpleLama()
-    return get_lama._instance
-
-def get_clipseg():
-    if not hasattr(get_clipseg, '_instance'):
-        print("Loading CLIPSeg model...")
-        processor = CLIPSegProcessor.from_pretrained("CIDAS/clipseg-rd64-refined")
-        model = CLIPSegForImageSegmentation.from_pretrained("CIDAS/clipseg-rd64-refined")
-        get_clipseg._instance = (processor, model)
-    return get_clipseg._instance
+        _lama = SimpleLama()
+        print("LaMa loaded")
+    return _lama
 
 def get_ocr():
-    if not hasattr(get_ocr, '_instance'):
+    global _ocr
+    if _ocr is None:
         print("Loading PaddleOCR model...")
         from paddleocr import PaddleOCR
-        get_ocr._instance = PaddleOCR(lang='en', use_gpu=False)
-    return get_ocr._instance
+        _ocr = PaddleOCR(lang='en', use_gpu=False)
+        print("PaddleOCR loaded")
+    return _ocr
 
 def detect_text_mask(img_bgr):
-    """Generates a razor-sharp mask specifically for moving text/watermarks"""
-    if img_bgr is None: return None
+    """Generates a TIGHT mask around text only"""
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h, w = rgb.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -39,132 +35,123 @@ def detect_text_mask(img_bgr):
             for line in res[0]:
                 pts = np.array(line[0], dtype=np.int32)
                 cv2.fillPoly(mask, [pts], 255)
-            # Tight dilation to prevent massive blurry blobs
-            kernel = np.ones((11, 11), np.uint8)
+            # TIGHT dilation — just enough to catch anti-aliased edges
+            kernel = np.ones((5, 5), np.uint8)
             mask = cv2.dilate(mask, kernel, iterations=1)
     except Exception as e:
-        pass
+        print(f"OCR error: {e}")
     return mask
 
-def create_mask_from_text(img_bgr, prompt):
-    """Hybrid Router: Chooses the best AI based on the user's prompt"""
-    if img_bgr is None: return None
-    
-    # 1. If it's a standard watermark, route to the razor-sharp OCR
-    text_prompts = ["watermark text logo", "text", "watermark", "logo", "words"]
-    if prompt.lower().strip() in text_prompts:
-        return detect_text_mask(img_bgr)
-    
-    # 2. If it's a physical object (e.g. "telephone"), route to CLIPSeg
-    processor, model = get_clipseg()
-    rgb_image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(rgb_image)
-    
-    inputs = processor(text=[prompt], images=[pil_image], padding="max_length", return_tensors="pt")
-    
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    preds = outputs.logits.unsqueeze(1)
-    mask = torch.sigmoid(preds[0][0]).numpy()
-    
-    h, w = img_bgr.shape[:2]
-    mask = cv2.resize(mask, (w, h))
-    
-    binary_mask = (mask > 0.3).astype(np.uint8) * 255
-    kernel = np.ones((15, 15), np.uint8)
-    binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
-    
-    return binary_mask
+def sharpen_image(img_bgr):
+    """Unsharp mask to restore crispness after inpainting"""
+    gaussian = cv2.GaussianBlur(img_bgr, (0, 0), 3)
+    return cv2.addWeighted(img_bgr, 1.5, gaussian, -0.5, 0)
 
-def process_image(input_path, output_path, prompt):
+def feather_mask(mask, radius=3):
+    """Soft edges on mask so inpainting blends naturally"""
+    return cv2.GaussianBlur(mask, (radius*2+1, radius*2+1), 0)
+
+def process_image(input_path, output_path):
     img = cv2.imread(input_path)
     if img is None:
-        return {"error": "Corrupted image file. AI could not read it."}
-        
-    mask = create_mask_from_text(img, prompt)
-    if mask is None or np.max(mask) == 0:
-        return {"error": f"AI could not find '{prompt}' in the image."}
+        return {"error": "Cannot read image"}
     
-    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    mask_pil = Image.fromarray(mask).convert('L')
+    mask = detect_text_mask(img)
+    if np.max(mask) == 0:
+        return {"error": "No watermark detected"}
+    
+    # Feather mask edges for smoother blending
+    mask = feather_mask(mask, radius=3)
     
     lama = get_lama()
-    result_pil = lama(img_pil, mask_pil)
+    result = lama(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask)
+    result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
     
-    if not isinstance(result_pil, Image.Image):
-        return {"error": "AI model failed to generate a result."}
+    # Sharpen to remove LaMa's inherent softness
+    result_bgr = sharpen_image(result_bgr)
     
-    result_np = np.array(result_pil)
-    cv2.imwrite(output_path, cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(output_path, result_bgr)
     return {"success": True}
 
-def process_video(input_path, output_path, prompt):
+def process_video(input_path, output_path):
     cap = cv2.VideoCapture(input_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
     tmp = f"/tmp/{uuid.uuid4()}"
-    os.makedirs(f"{tmp}/frames", exist_ok=True)
-    os.makedirs(f"{tmp}/out", exist_ok=True)
+    os.makedirs(f"{tmp}/frames")
+    os.makedirs(f"{tmp}/out")
     
     idx = 0
     while True:
         ret, frame = cap.read()
-        if not ret or frame is None: break
-        success = cv2.imwrite(f"{tmp}/frames/{idx:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        if success: idx += 1
-        else: break
+        if not ret:
+            break
+        cv2.imwrite(f"{tmp}/frames/{idx:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        idx += 1
     cap.release()
     
-    if idx == 0: 
+    if idx == 0:
+        return {"error": "Empty video"}
+    
+    print(f"Processing {idx} frames...")
+    
+    # Detect mask ONCE from first frame (watermarks are static)
+    first = cv2.imread(f"{tmp}/frames/000000.jpg")
+    mask = detect_text_mask(first)
+    
+    if np.max(mask) == 0:
         shutil.rmtree(tmp, ignore_errors=True)
-        return {"error": "Video codec not supported or corrupted file."}
+        return {"error": "No watermark detected in video"}
     
-    print("Tracking objects per-frame...")
+    # Feather the mask for smoother edges
+    mask = feather_mask(mask, radius=3)
+    
     lama = get_lama()
-    frames_with_detections = 0
     
-    # 3. Process EVERY frame independently so the AI chases moving objects
     for i in range(idx):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")
-        if frame is None: 
-            prev = cv2.imread(f"{tmp}/out/{i-1:06d}.jpg") if i > 0 else np.zeros((100, 100, 3), dtype=np.uint8)
-            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", prev)
-            continue
-            
-        frame_mask = create_mask_from_text(frame, prompt)
-        
-        if frame_mask is not None and np.max(frame_mask) > 0:
-            frames_with_detections += 1
-            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            mask_pil = Image.fromarray(frame_mask).convert('L')
-            
-            result_pil = lama(img_pil, mask_pil)
-            
-            if isinstance(result_pil, Image.Image):
-                result_np = np.array(result_pil)
-                cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-            else:
-                cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
+        if np.max(mask) > 0:
+            result = lama(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), mask)
+            result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+            # Sharpen each frame
+            result_bgr = sharpen_image(result_bgr)
+            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", result_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         else:
-            # If the watermark disappears from the screen, leave the frame alone
-            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
-            
-    if frames_with_detections == 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        return {"error": f"AI could not find '{prompt}' to remove in this video."}
+            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if i % 30 == 0:
+            print(f"Frame {i}/{idx}")
     
+    # Reconstruct video with audio
     has_audio = False
     try:
-        probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', input_path], capture_output=True, text=True)
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', input_path],
+            capture_output=True, text=True, check=True
+        )
         has_audio = 'audio' in probe.stdout
-    except: pass
+    except Exception:
+        pass
     
     if has_audio:
         audio_path = os.path.join(tmp, "audio.aac")
-        subprocess.run(['ffmpeg', '-y', '-i', input_path, '-vn', '-c:a', 'copy', audio_path], capture_output=True)
-        subprocess.run(['ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg", '-i', audio_path, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast', '-c:a', 'aac', '-b:a', '128k', '-shortest', output_path], capture_output=True)
+        subprocess.run(
+            ['ffmpeg', '-y', '-i', input_path, '-vn', '-c:a', 'copy', audio_path],
+            check=True, capture_output=True
+        )
+        subprocess.run([
+            'ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg",
+            '-i', audio_path, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast',
+            '-c:a', 'aac', '-b:a', '128k', '-shortest', output_path
+        ], check=True, capture_output=True)
     else:
-        subprocess.run(['ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg", '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast', output_path], capture_output=True)
+        subprocess.run([
+            'ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg",
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast',
+            output_path
+        ], check=True, capture_output=True)
     
     shutil.rmtree(tmp, ignore_errors=True)
     return {"success": True}
@@ -191,9 +178,8 @@ def handler(job):
     file_type = input_data.get("file_type", "image")
     webhook_url = input_data.get("webhook_url")
     job_id = input_data.get("job_id")
-    prompt = input_data.get("prompt", "watermark text logo") 
 
-    print(f"Job {job_id} started. Type: {file_type}, Prompt: {prompt}")
+    print(f"Job {job_id} started. Type: {file_type}")
 
     if not file_url or not webhook_url:
         return {"error": "Missing file_url or webhook_url"}
@@ -212,29 +198,43 @@ def handler(job):
                 r.raise_for_status()
                 break
             except Exception as e:
-                if attempt == 2: raise
+                print(f"Download attempt {attempt+1} failed: {e}")
+                if attempt == 2:
+                    raise
                 time.sleep(2)
         
         with open(input_path, "wb") as f:
             f.write(r.content)
+        print(f"Downloaded {os.path.getsize(input_path)} bytes")
 
         if file_type == "image":
-            res = process_image(input_path, output_path, prompt)
+            res = process_image(input_path, output_path)
         else:
-            res = process_video(input_path, output_path, prompt)
+            res = process_video(input_path, output_path)
 
         if res.get("error"):
+            print(f"Processing error: {res['error']}")
             send_webhook(webhook_url, {"job_id": job_id, "error": res["error"]})
             return res
 
+        print(f"Uploading result to webhook")
         with open(output_path, "rb") as f:
-            send_webhook(webhook_url, {"job_id": job_id, "file_type": file_type}, files={"file": (f"result{ext}", f)})
+            send_webhook(
+                webhook_url,
+                {"job_id": job_id, "file_type": file_type},
+                files={"file": (f"result{ext}", f)}
+            )
+        print(f"Job {job_id} completed")
         return {"success": True}
 
     except Exception as e:
         err_msg = str(e)
-        try: send_webhook(webhook_url, {"job_id": job_id, "error": err_msg})
-        except: pass
+        print(f"Job {job_id} crashed: {err_msg}")
+        print(traceback.format_exc())
+        try:
+            send_webhook(webhook_url, {"job_id": job_id, "error": err_msg})
+        except Exception:
+            pass
         return {"error": err_msg}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

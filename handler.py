@@ -24,7 +24,6 @@ def create_mask_from_text(img_bgr, prompt):
     
     processor, model = get_clipseg()
     
-    # 1. Convert OpenCV array to PIL Image for HuggingFace
     rgb_image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(rgb_image)
     
@@ -39,9 +38,13 @@ def create_mask_from_text(img_bgr, prompt):
     h, w = img_bgr.shape[:2]
     mask = cv2.resize(mask, (w, h))
     
-    binary_mask = (mask > 0.4).astype(np.uint8) * 255
-    kernel = np.ones((15, 15), np.uint8)
-    binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
+    # FIX 1: Lowered threshold from 0.4 to 0.2 to catch faint/transparent edges of watermarks
+    binary_mask = (mask > 0.2).astype(np.uint8) * 255
+    
+    # FIX 2: Massive dilation. Increased kernel to 25x25 and iterations to 3.
+    # This acts like a very thick paintbrush to guarantee no fractions of text are left behind.
+    kernel = np.ones((25, 25), np.uint8)
+    binary_mask = cv2.dilate(binary_mask, kernel, iterations=3)
     
     return binary_mask
 
@@ -54,18 +57,15 @@ def process_image(input_path, output_path, prompt):
     if mask is None or np.max(mask) == 0:
         return {"error": f"AI could not find '{prompt}' in the image."}
     
-    # 2. Convert to strict PIL Images for LaMa Inpainting
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     mask_pil = Image.fromarray(mask).convert('L')
     
     lama = get_lama()
     result_pil = lama(img_pil, mask_pil)
     
-    # Safety Check
     if not isinstance(result_pil, Image.Image):
         return {"error": "AI model failed to generate a result."}
     
-    # 3. Convert back to OpenCV format
     result_np = np.array(result_pil)
     cv2.imwrite(output_path, cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR))
     return {"success": True}
@@ -90,29 +90,12 @@ def process_video(input_path, output_path, prompt):
         shutil.rmtree(tmp, ignore_errors=True)
         return {"error": "Video codec not supported or corrupted file."}
     
-    print("Scanning multiple frames for dynamic objects...")
-    master_mask = None
-    samples = [0, idx//4, idx//2, (idx*3)//4, idx-1]
-    
-    for s in samples:
-        if s >= idx: continue
-        frame = cv2.imread(f"{tmp}/frames/{s:06d}.jpg")
-        if frame is None: continue 
-        
-        current_mask = create_mask_from_text(frame, prompt)
-        if current_mask is not None and np.max(current_mask) > 0:
-            if master_mask is None:
-                master_mask = current_mask
-            else:
-                master_mask = cv2.bitwise_or(master_mask, current_mask)
-        
-    if master_mask is None or np.max(master_mask) == 0:
-        shutil.rmtree(tmp, ignore_errors=True)
-        return {"error": f"AI could not find '{prompt}' to remove."}
-
-    master_mask_pil = Image.fromarray(master_mask).convert('L')
+    print("Tracking objects per-frame...")
     lama = get_lama()
+    frames_with_detections = 0
     
+    # FIX 3: Per-Frame tracking. The AI now evaluates every single frame. 
+    # If the watermark jumps or moves, the AI mask chases it.
     for i in range(idx):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")
         if frame is None: 
@@ -120,15 +103,27 @@ def process_video(input_path, output_path, prompt):
             cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", prev)
             continue
             
-        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        result_pil = lama(img_pil, master_mask_pil)
+        frame_mask = create_mask_from_text(frame, prompt)
         
-        # Verify AI actually returned a valid image
-        if isinstance(result_pil, Image.Image):
-            result_np = np.array(result_pil)
-            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if frame_mask is not None and np.max(frame_mask) > 0:
+            frames_with_detections += 1
+            img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            mask_pil = Image.fromarray(frame_mask).convert('L')
+            
+            result_pil = lama(img_pil, mask_pil)
+            
+            if isinstance(result_pil, Image.Image):
+                result_np = np.array(result_pil)
+                cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            else:
+                cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
         else:
+            # If the watermark fades out or isn't on this specific frame, just keep the raw frame.
             cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
+            
+    if frames_with_detections == 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"error": f"AI could not find '{prompt}' in any frame of this video."}
     
     has_audio = False
     try:

@@ -20,7 +20,6 @@ def get_clipseg():
 
 def create_mask_from_text(img_bgr, prompt):
     """Uses CLIPSeg to find the object described in the text prompt and creates a mask."""
-    # Defensive check to prevent crash if frame is corrupted
     if img_bgr is None: return None
     
     processor, model = get_clipseg()
@@ -65,7 +64,11 @@ def process_image(input_path, output_path, prompt):
     
     lama = get_lama()
     result = lama(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask)
-    cv2.imwrite(output_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+    
+    # FIX: Convert PIL Image to Numpy Array for OpenCV
+    result_np = np.array(result)
+    
+    cv2.imwrite(output_path, cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR))
     return {"success": True}
 
 def process_video(input_path, output_path, prompt):
@@ -97,7 +100,7 @@ def process_video(input_path, output_path, prompt):
     for s in samples:
         if s >= idx: continue
         frame = cv2.imread(f"{tmp}/frames/{s:06d}.jpg")
-        if frame is None: continue # Skip corrupted frames safely
+        if frame is None: continue 
         
         current_mask = create_mask_from_text(frame, prompt)
         if current_mask is not None and np.max(current_mask) > 0:
@@ -115,13 +118,16 @@ def process_video(input_path, output_path, prompt):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")
         
         if frame is None: 
-            # Fallback: copy the previous frame if one is randomly missing/corrupted
             prev_frame = cv2.imread(f"{tmp}/out/{i-1:06d}.jpg") if i > 0 else np.zeros((int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 3), dtype=np.uint8)
             cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", prev_frame)
             continue
             
         result = lama(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), master_mask)
-        cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        
+        # FIX: Convert PIL Image to Numpy Array for OpenCV
+        result_np = np.array(result)
+        
+        cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     
     has_audio = False
     try:
@@ -161,7 +167,7 @@ def handler(job):
     file_type = input_data.get("file_type", "image")
     webhook_url = input_data.get("webhook_url")
     job_id = input_data.get("job_id")
-    prompt = input_data.get("prompt", "watermark text logo") # Matches your Node bot payload
+    prompt = input_data.get("prompt", "watermark text logo") 
 
     print(f"Job {job_id} started. Type: {file_type}, Prompt: {prompt}")
 

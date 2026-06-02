@@ -19,11 +19,44 @@ def get_clipseg():
         get_clipseg._instance = (processor, model)
     return get_clipseg._instance
 
+def get_ocr():
+    if not hasattr(get_ocr, '_instance'):
+        print("Loading PaddleOCR model...")
+        from paddleocr import PaddleOCR
+        get_ocr._instance = PaddleOCR(lang='en', use_gpu=False)
+    return get_ocr._instance
+
+def detect_text_mask(img_bgr):
+    """Generates a razor-sharp mask specifically for moving text/watermarks"""
+    if img_bgr is None: return None
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    try:
+        ocr = get_ocr()
+        res = ocr.ocr(rgb)
+        if res and res[0]:
+            for line in res[0]:
+                pts = np.array(line[0], dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
+            # Tight dilation to prevent massive blurry blobs
+            kernel = np.ones((11, 11), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+    except Exception as e:
+        pass
+    return mask
+
 def create_mask_from_text(img_bgr, prompt):
+    """Hybrid Router: Chooses the best AI based on the user's prompt"""
     if img_bgr is None: return None
     
-    processor, model = get_clipseg()
+    # 1. If it's a standard watermark, route to the razor-sharp OCR
+    text_prompts = ["watermark text logo", "text", "watermark", "logo", "words"]
+    if prompt.lower().strip() in text_prompts:
+        return detect_text_mask(img_bgr)
     
+    # 2. If it's a physical object (e.g. "telephone"), route to CLIPSeg
+    processor, model = get_clipseg()
     rgb_image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(rgb_image)
     
@@ -38,13 +71,9 @@ def create_mask_from_text(img_bgr, prompt):
     h, w = img_bgr.shape[:2]
     mask = cv2.resize(mask, (w, h))
     
-    # FIX 1: Lowered threshold from 0.4 to 0.2 to catch faint/transparent edges of watermarks
-    binary_mask = (mask > 0.2).astype(np.uint8) * 255
-    
-    # FIX 2: Massive dilation. Increased kernel to 25x25 and iterations to 3.
-    # This acts like a very thick paintbrush to guarantee no fractions of text are left behind.
-    kernel = np.ones((25, 25), np.uint8)
-    binary_mask = cv2.dilate(binary_mask, kernel, iterations=3)
+    binary_mask = (mask > 0.3).astype(np.uint8) * 255
+    kernel = np.ones((15, 15), np.uint8)
+    binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
     
     return binary_mask
 
@@ -94,8 +123,7 @@ def process_video(input_path, output_path, prompt):
     lama = get_lama()
     frames_with_detections = 0
     
-    # FIX 3: Per-Frame tracking. The AI now evaluates every single frame. 
-    # If the watermark jumps or moves, the AI mask chases it.
+    # 3. Process EVERY frame independently so the AI chases moving objects
     for i in range(idx):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")
         if frame is None: 
@@ -118,12 +146,12 @@ def process_video(input_path, output_path, prompt):
             else:
                 cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
         else:
-            # If the watermark fades out or isn't on this specific frame, just keep the raw frame.
+            # If the watermark disappears from the screen, leave the frame alone
             cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
             
     if frames_with_detections == 0:
         shutil.rmtree(tmp, ignore_errors=True)
-        return {"error": f"AI could not find '{prompt}' in any frame of this video."}
+        return {"error": f"AI could not find '{prompt}' to remove in this video."}
     
     has_audio = False
     try:
@@ -184,14 +212,11 @@ def handler(job):
                 r.raise_for_status()
                 break
             except Exception as e:
-                print(f"Download attempt {attempt+1} failed: {e}")
-                if attempt == 2:
-                    raise
+                if attempt == 2: raise
                 time.sleep(2)
         
         with open(input_path, "wb") as f:
             f.write(r.content)
-        print(f"Downloaded {os.path.getsize(input_path)} bytes")
 
         if file_type == "image":
             res = process_image(input_path, output_path, prompt)
@@ -199,28 +224,17 @@ def handler(job):
             res = process_video(input_path, output_path, prompt)
 
         if res.get("error"):
-            print(f"Processing error: {res['error']}")
             send_webhook(webhook_url, {"job_id": job_id, "error": res["error"]})
             return res
 
-        print(f"Uploading result to webhook")
         with open(output_path, "rb") as f:
-            send_webhook(
-                webhook_url,
-                {"job_id": job_id, "file_type": file_type},
-                files={"file": (f"result{ext}", f)}
-            )
-        print(f"Job {job_id} completed")
+            send_webhook(webhook_url, {"job_id": job_id, "file_type": file_type}, files={"file": (f"result{ext}", f)})
         return {"success": True}
 
     except Exception as e:
         err_msg = str(e)
-        print(f"Job {job_id} crashed: {err_msg}")
-        print(traceback.format_exc())
-        try:
-            send_webhook(webhook_url, {"job_id": job_id, "error": err_msg})
-        except Exception:
-            pass
+        try: send_webhook(webhook_url, {"job_id": job_id, "error": err_msg})
+        except: pass
         return {"error": err_msg}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

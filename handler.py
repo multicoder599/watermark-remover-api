@@ -1,6 +1,7 @@
 import runpod, os, uuid, shutil, subprocess, requests, time, traceback
 import cv2, numpy as np
 import torch
+from PIL import Image
 from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
 
 def get_lama():
@@ -19,33 +20,26 @@ def get_clipseg():
     return get_clipseg._instance
 
 def create_mask_from_text(img_bgr, prompt):
-    """Uses CLIPSeg to find the object described in the text prompt and creates a mask."""
     if img_bgr is None: return None
     
     processor, model = get_clipseg()
     
-    # Convert BGR (OpenCV) to RGB (HuggingFace)
+    # 1. Convert OpenCV array to PIL Image for HuggingFace
     rgb_image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(rgb_image)
     
-    # Process image and text
-    inputs = processor(text=[prompt], images=[rgb_image], padding="max_length", return_tensors="pt")
+    inputs = processor(text=[prompt], images=[pil_image], padding="max_length", return_tensors="pt")
     
-    # Predict
     with torch.no_grad():
         outputs = model(**inputs)
     
-    # Convert prediction to an OpenCV-friendly mask
     preds = outputs.logits.unsqueeze(1)
     mask = torch.sigmoid(preds[0][0]).numpy()
     
-    # Resize mask back to original image dimensions
     h, w = img_bgr.shape[:2]
     mask = cv2.resize(mask, (w, h))
     
-    # Thresholding: Convert probabilities into a hard black/white mask
     binary_mask = (mask > 0.4).astype(np.uint8) * 255
-    
-    # Dilate the mask slightly to ensure the edges of the object are fully covered
     kernel = np.ones((15, 15), np.uint8)
     binary_mask = cv2.dilate(binary_mask, kernel, iterations=2)
     
@@ -53,21 +47,26 @@ def create_mask_from_text(img_bgr, prompt):
 
 def process_image(input_path, output_path, prompt):
     img = cv2.imread(input_path)
-    
     if img is None:
         return {"error": "Corrupted image file. AI could not read it."}
         
     mask = create_mask_from_text(img, prompt)
-    
     if mask is None or np.max(mask) == 0:
         return {"error": f"AI could not find '{prompt}' in the image."}
     
+    # 2. Convert to strict PIL Images for LaMa Inpainting
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    mask_pil = Image.fromarray(mask).convert('L')
+    
     lama = get_lama()
-    result = lama(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask)
+    result_pil = lama(img_pil, mask_pil)
     
-    # FIX: Convert PIL Image to Numpy Array for OpenCV
-    result_np = np.array(result)
+    # Safety Check
+    if not isinstance(result_pil, Image.Image):
+        return {"error": "AI model failed to generate a result."}
     
+    # 3. Convert back to OpenCV format
+    result_np = np.array(result_pil)
     cv2.imwrite(output_path, cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR))
     return {"success": True}
 
@@ -83,10 +82,8 @@ def process_video(input_path, output_path, prompt):
         ret, frame = cap.read()
         if not ret or frame is None: break
         success = cv2.imwrite(f"{tmp}/frames/{idx:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        if success:
-            idx += 1
-        else:
-            break
+        if success: idx += 1
+        else: break
     cap.release()
     
     if idx == 0: 
@@ -113,21 +110,25 @@ def process_video(input_path, output_path, prompt):
         shutil.rmtree(tmp, ignore_errors=True)
         return {"error": f"AI could not find '{prompt}' to remove."}
 
+    master_mask_pil = Image.fromarray(master_mask).convert('L')
     lama = get_lama()
+    
     for i in range(idx):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")
-        
         if frame is None: 
-            prev_frame = cv2.imread(f"{tmp}/out/{i-1:06d}.jpg") if i > 0 else np.zeros((int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 3), dtype=np.uint8)
-            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", prev_frame)
+            prev = cv2.imread(f"{tmp}/out/{i-1:06d}.jpg") if i > 0 else np.zeros((100, 100, 3), dtype=np.uint8)
+            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", prev)
             continue
             
-        result = lama(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), master_mask)
+        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        result_pil = lama(img_pil, master_mask_pil)
         
-        # FIX: Convert PIL Image to Numpy Array for OpenCV
-        result_np = np.array(result)
-        
-        cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        # Verify AI actually returned a valid image
+        if isinstance(result_pil, Image.Image):
+            result_np = np.array(result_pil)
+            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        else:
+            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame)
     
     has_audio = False
     try:

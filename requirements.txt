@@ -8,3 +8,4 @@ paddlepaddle
 numpy
 requests
 Pillow
+transformers

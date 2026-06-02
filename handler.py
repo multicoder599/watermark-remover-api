@@ -1,25 +1,18 @@
 import runpod, os, uuid, shutil, subprocess, requests, time, traceback
 import cv2, numpy as np
 
-# Lightweight imports only ^^
-# Heavy models loaded INSIDE handler on first job
-
 def get_lama():
-    """Lazy load LaMa (GPU accelerated)"""
     if not hasattr(get_lama, '_instance'):
         print("Loading LaMa model...")
         from simple_lama_inpainting import SimpleLama
         get_lama._instance = SimpleLama()
-        print("LaMa loaded")
     return get_lama._instance
 
 def get_ocr():
-    """Lazy load PaddleOCR (CPU is fine for text detection)"""
     if not hasattr(get_ocr, '_instance'):
         print("Loading PaddleOCR model...")
         from paddleocr import PaddleOCR
         get_ocr._instance = PaddleOCR(lang='en', use_gpu=False)
-        print("PaddleOCR loaded")
     return get_ocr._instance
 
 def detect_text_mask(img_bgr):
@@ -33,7 +26,9 @@ def detect_text_mask(img_bgr):
             for line in res[0]:
                 pts = np.array(line[0], dtype=np.int32)
                 cv2.fillPoly(mask, [pts], 255)
-            kernel = np.ones((9, 9), np.uint8)
+            
+            # Aggressive expansion to cover logos next to text (like TikTok icons)
+            kernel = np.ones((15, 15), np.uint8)
             mask = cv2.dilate(mask, kernel, iterations=2)
     except Exception as e:
         print(f"OCR error: {e}")
@@ -41,11 +36,10 @@ def detect_text_mask(img_bgr):
 
 def process_image(input_path, output_path):
     img = cv2.imread(input_path)
-    if img is None:
-        return {"error": "Cannot read image"}
     mask = detect_text_mask(img)
     if np.max(mask) == 0:
-        return {"error": "No watermark detected"}
+        return {"error": "AI could not detect any readable watermark in this image."}
+    
     lama = get_lama()
     result = lama(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask)
     cv2.imwrite(output_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
@@ -54,9 +48,6 @@ def process_image(input_path, output_path):
 def process_video(input_path, output_path):
     cap = cv2.VideoCapture(input_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     tmp = f"/tmp/{uuid.uuid4()}"
     os.makedirs(f"{tmp}/frames")
@@ -65,77 +56,61 @@ def process_video(input_path, output_path):
     idx = 0
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         cv2.imwrite(f"{tmp}/frames/{idx:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         idx += 1
     cap.release()
     
-    if idx == 0:
-        return {"error": "Empty video"}
+    if idx == 0: return {"error": "Empty video"}
     
-    print(f"Processing {idx} frames...")
-    first = cv2.imread(f"{tmp}/frames/000000.jpg")
-    mask = detect_text_mask(first)
+    # SMARTER AUTO-DETECT: Sample 5 different points in the video
+    print("Scanning multiple frames for dynamic watermarks...")
+    master_mask = None
+    samples = [0, idx//4, idx//2, (idx*3)//4, idx-1]
+    
+    for s in samples:
+        if s >= idx: continue
+        frame = cv2.imread(f"{tmp}/frames/{s:06d}.jpg")
+        current_mask = detect_text_mask(frame)
+        if np.max(current_mask) > 0:
+            if master_mask is None:
+                master_mask = current_mask
+            else:
+                # Combine masks so jumping watermarks are fully covered
+                master_mask = cv2.bitwise_or(master_mask, current_mask)
+    
+    if master_mask is None or np.max(master_mask) == 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"error": "AI could not auto-detect any watermark in this video."}
+
     lama = get_lama()
-    
     for i in range(idx):
         frame = cv2.imread(f"{tmp}/frames/{i:06d}.jpg")
-        if np.max(mask) > 0:
-            result = lama(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), mask)
-            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        else:
-            cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        if i % 30 == 0:
-            print(f"Frame {i}/{idx}")
+        result = lama(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), master_mask)
+        cv2.imwrite(f"{tmp}/out/{i:06d}.jpg", cv2.cvtColor(result, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     
-    # Check audio
+    # Reattach Audio
     has_audio = False
     try:
-        probe = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', input_path],
-            capture_output=True, text=True, check=True
-        )
+        probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', input_path], capture_output=True, text=True)
         has_audio = 'audio' in probe.stdout
-    except Exception:
-        pass
+    except: pass
     
     if has_audio:
         audio_path = os.path.join(tmp, "audio.aac")
-        subprocess.run(
-            ['ffmpeg', '-y', '-i', input_path, '-vn', '-c:a', 'copy', audio_path],
-            check=True, capture_output=True
-        )
-        subprocess.run([
-            'ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg",
-            '-i', audio_path, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast',
-            '-c:a', 'aac', '-b:a', '128k', '-shortest', output_path
-        ], check=True, capture_output=True)
+        subprocess.run(['ffmpeg', '-y', '-i', input_path, '-vn', '-c:a', 'copy', audio_path], capture_output=True)
+        subprocess.run(['ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg", '-i', audio_path, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast', '-c:a', 'aac', '-b:a', '128k', '-shortest', output_path], capture_output=True)
     else:
-        subprocess.run([
-            'ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg",
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast',
-            output_path
-        ], check=True, capture_output=True)
+        subprocess.run(['ffmpeg', '-y', '-framerate', str(fps), '-i', f"{tmp}/out/%06d.jpg", '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '23', '-preset', 'fast', output_path], capture_output=True)
     
     shutil.rmtree(tmp, ignore_errors=True)
     return {"success": True}
 
-def send_webhook(webhook_url, payload, files=None, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            if files:
-                r = requests.post(webhook_url, files=files, data=payload, timeout=120)
-            else:
-                r = requests.post(webhook_url, json=payload, timeout=30)
-            print(f"Webhook attempt {attempt+1}: {r.status_code}")
-            return True
-        except Exception as e:
-            print(f"Webhook attempt {attempt+1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep(2 ** attempt)
-    return False
+def send_webhook(webhook_url, payload, files=None):
+    try:
+        if files: requests.post(webhook_url, files=files, data=payload, timeout=120)
+        else: requests.post(webhook_url, json=payload, timeout=30)
+    except: pass
 
 def handler(job):
     input_data = job.get("input", {})
@@ -144,63 +119,31 @@ def handler(job):
     webhook_url = input_data.get("webhook_url")
     job_id = input_data.get("job_id")
 
-    print(f"Job {job_id} started. Type: {file_type}")
-
-    if not file_url or not webhook_url:
-        return {"error": "Missing file_url or webhook_url"}
+    if not file_url or not webhook_url: return {"error": "Missing params"}
 
     tmp = f"/tmp/{uuid.uuid4()}"
     os.makedirs(tmp, exist_ok=True)
     ext = ".mp4" if file_type == "video" else ".jpg"
-    input_path = os.path.join(tmp, f"input{ext}")
-    output_path = os.path.join(tmp, f"result{ext}")
+    input_path, output_path = os.path.join(tmp, f"in{ext}"), os.path.join(tmp, f"out{ext}")
 
     try:
-        print(f"Downloading from {file_url}")
-        for attempt in range(3):
-            try:
-                r = requests.get(file_url, timeout=120)
-                r.raise_for_status()
-                break
-            except Exception as e:
-                print(f"Download attempt {attempt+1} failed: {e}")
-                if attempt == 2:
-                    raise
-                time.sleep(2)
-        
-        with open(input_path, "wb") as f:
-            f.write(r.content)
-        print(f"Downloaded {os.path.getsize(input_path)} bytes")
+        r = requests.get(file_url, timeout=120)
+        with open(input_path, "wb") as f: f.write(r.content)
 
-        if file_type == "image":
-            res = process_image(input_path, output_path)
-        else:
-            res = process_video(input_path, output_path)
+        if file_type == "image": res = process_image(input_path, output_path)
+        else: res = process_video(input_path, output_path)
 
         if res.get("error"):
-            print(f"Processing error: {res['error']}")
             send_webhook(webhook_url, {"job_id": job_id, "error": res["error"]})
             return res
 
-        print(f"Uploading result to webhook")
         with open(output_path, "rb") as f:
-            send_webhook(
-                webhook_url,
-                {"job_id": job_id, "file_type": file_type},
-                files={"file": (f"result{ext}", f)}
-            )
-        print(f"Job {job_id} completed")
+            send_webhook(webhook_url, {"job_id": job_id, "file_type": file_type}, files={"file": (f"result{ext}", f)})
         return {"success": True}
-
     except Exception as e:
-        err_msg = str(e)
-        print(f"Job {job_id} crashed: {err_msg}")
-        print(traceback.format_exc())
-        try:
-            send_webhook(webhook_url, {"job_id": job_id, "error": err_msg})
-        except Exception:
-            pass
-        return {"error": err_msg}
+        err = str(e)
+        send_webhook(webhook_url, {"job_id": job_id, "error": err})
+        return {"error": err}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
